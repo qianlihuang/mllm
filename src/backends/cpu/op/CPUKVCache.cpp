@@ -4,6 +4,10 @@
 #include "ParamLoader.hpp"
 #include "Types.hpp"
 
+#define SPARSE_THRESHOLD 300  // 稀疏化阈值，当 token 数量超过此值时触发稀疏化
+#define CACHE_BUDGET_RATIO 0.999 // CACHE_BUDGET 占总 token 数量的比例
+#define LOCAL_SIZE_RATIO 0.999   // LOCAL_SIZE 占 CACHE_BUDGET 的比例
+
 int n_pack = 16;
 namespace mllm {
 CPUKVCache::CPUKVCache(Backend *bn, string opName, int n_rep, int cache_max, int threadCount) :
@@ -71,8 +75,20 @@ ErrorCode CPUKVCache::reshape(vector<shared_ptr<Tensor>> inputs,
 #ifdef LLAMAFILE_SGEMM
     if (!for_xnn_ && sequence % n_pack != 0) sequence = ((sequence + (n_pack - 1)) / n_pack) * n_pack;
 #endif
-    outputs[0]->reshape(inputs[0]->batch(), inputs[0]->head() * n_rep_, sequence,
-                        inputs[0]->dimension());
+    // outputs[0]->reshape(inputs[0]->batch(), inputs[0]->head() * n_rep_, sequence,
+    //                     inputs[0]->dimension());
+
+    // StreamingLLM: 根据阈值决定是否应用稀疏化
+    if (cache_seq_len_ <= SPARSE_THRESHOLD) {
+        // 阈值以下，保留所有 token
+        outputs[0]->reshape(inputs[0]->batch(), inputs[0]->head() * n_rep_, sequence, inputs[0]->dimension());
+    } else {
+        // 阈值以上，计算 cache_budget 并限制输出形状
+        int cache_budget = static_cast<int>(cache_seq_len_ * CACHE_BUDGET_RATIO);
+        cache_budget = std::max(cache_budget, 1); // 确保至少为1
+        outputs[0]->reshape(inputs[0]->batch(), inputs[0]->head() * n_rep_, cache_budget, inputs[0]->dimension());
+    }
+
     if (sequence > cache_limit_) {
         MLLM_LOG_ERROR_STREAM << "\n[ERROR]: Current tokens exceed cache limit: " << sequence << ">"
                               << cache_limit_ << ";"
@@ -158,6 +174,62 @@ ErrorCode CPUKVCache::execute(vector<shared_ptr<Tensor>> inputs,
             std::cout << "ERROR Ctype in KVCcache;" << std::endl;
         }
     }
+    // if(cache_seq_len_>WINDOW_SIZE){
+    //     outputs[0]->saveData<float>();
+    //     exit(0);
+    // }
+
+    // 处理 outputs[0] 的数据
+    if (cache_seq_len_ <= SPARSE_THRESHOLD) {
+        // 直接浅拷贝所有 token
+        outputs[0]->shallowCopyFrom(cache_, false, {0, 0, 0, 0});
+    } else {
+        // 计算 cache_budget 和 local_size
+        int cache_budget = static_cast<int>(cache_seq_len_ * CACHE_BUDGET_RATIO);
+        cache_budget = std::max(cache_budget, 1);
+        int local_size = static_cast<int>(cache_budget * LOCAL_SIZE_RATIO);
+        local_size = std::max(local_size, 1);
+        int sink = cache_budget - local_size;
+
+        // 根据数据类型深拷贝 sink 和 local_size 的数据
+        for (int b = 0; b < inputs[0]->batch(); ++b) {
+            for (int h = 0; h < inputs[0]->head() * n_rep_; ++h) {
+                if (cache_.dtype() == MLLM_TYPE_F32) {
+                    float* dst_ptr = outputs[0]->ptrAt<float>(b, h, 0, 0);
+                    // 拷贝 sink
+                    float* src_ptr = cache_.ptrAt<float>(b, h, 0, 0);
+                    size_t sink_size = sink * inputs[0]->dimension() * sizeof(float);
+                    memcpy(dst_ptr, src_ptr, sink_size);
+                    // 拷贝 recent
+                    int start_recent = cache_seq_len_ - local_size;
+                    src_ptr = cache_.ptrAt<float>(b, h, start_recent, 0);
+                    dst_ptr = outputs[0]->ptrAt<float>(b, h, sink, 0);
+                    size_t recent_size = local_size * inputs[0]->dimension() * sizeof(float);
+                    memcpy(dst_ptr, src_ptr, recent_size);
+                } else if (cache_.dtype() == MLLM_TYPE_F16) {
+                    mllm_fp16_t* dst_ptr = outputs[0]->ptrAt<mllm_fp16_t>(b, h, 0, 0);
+                    mllm_fp16_t* src_ptr = cache_.ptrAt<mllm_fp16_t>(b, h, 0, 0);
+                    size_t sink_size = sink * inputs[0]->dimension() * sizeof(mllm_fp16_t);
+                    memcpy(dst_ptr, src_ptr, sink_size);
+                    int start_recent = cache_seq_len_ - local_size;
+                    src_ptr = cache_.ptrAt<mllm_fp16_t>(b, h, start_recent, 0);
+                    dst_ptr = outputs[0]->ptrAt<mllm_fp16_t>(b, h, sink, 0);
+                    size_t recent_size = local_size * inputs[0]->dimension() * sizeof(mllm_fp16_t);
+                    memcpy(dst_ptr, src_ptr, recent_size);
+                } else if (cache_.dtype() == MLLM_TYPE_Q8_0) {
+                    block_q8_0* dst_ptr = outputs[0]->ptrAt<block_q8_0>(b, h, 0, 0);
+                    block_q8_0* src_ptr = cache_.ptrAt<block_q8_0>(b, h, 0, 0);
+                    size_t sink_size = sink * inputs[0]->dimension() * sizeof(block_q8_0) / QK8_0;
+                    memcpy(dst_ptr, src_ptr, sink_size);
+                    int start_recent = cache_seq_len_ - local_size;
+                    src_ptr = cache_.ptrAt<block_q8_0>(b, h, start_recent, 0);
+                    dst_ptr = outputs[0]->ptrAt<block_q8_0>(b, h, sink, 0);
+                    size_t recent_size = local_size * inputs[0]->dimension() * sizeof(block_q8_0) / QK8_0;
+                    memcpy(dst_ptr, src_ptr, recent_size);
+                }
+            }
+        }
+    }
     return Op::execute(inputs, outputs);
 }
 
@@ -169,10 +241,15 @@ ErrorCode CPUKVCache::setUp(vector<shared_ptr<Tensor>> inputs, vector<shared_ptr
     assert(inputs.size() == 1);
     assert(outputs.size() == 1);
     outputs[0]->setDtype(cache_.dtype());
-    outputs[0]->shallowCopyFrom(cache_, false, {0, 0, cache_seq_len_ / cache_limit_, 0});
-    if (inputs[0]->sequence() + cache_seq_len_ > cache_limit_) {
-        outputs[0]->shallowCopyFrom(cache_, false, {0, 0, cache_seq_len_ % cache_limit_ + 1, 0});
+
+    if (cache_seq_len_ <= SPARSE_THRESHOLD) {
+        // 阈值以下，直接浅拷贝所有 token，只是分配了内存，没有实际拷贝数据
+        outputs[0]->shallowCopyFrom(cache_, false, {0, 0, 0, 0});
+    } else {
+        // 分配新内存
+        outputs[0]->alloc();
     }
+
     if (inputs[0]->masterTensor() == nullptr) { inputs[0]->free(); }
     inputs[0]->shallowCopyFrom(cache_, false, {0, 0, cache_seq_len_ % cache_limit_, 0});
     /*没用

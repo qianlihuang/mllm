@@ -98,11 +98,11 @@ public:
             k = k_rope(k);
         }
         if (k_cache.ready() && v_cache.ready()) {
-            k = k_cache(k);
+            k = k_cache(k); //
             v = v_cache(v);
         }
-        k = k.transpose(SEQUENCE, DIMENSION);
-        auto qk = Tensor::mm(q, k);
+        k = k.transpose(SEQUENCE, DIMENSION); //
+        auto qk = Tensor::mm(q, k); //
         qk = qk / std::sqrt(attn_hidden_dim_);
         if (k_cache.ready() && v_cache.ready()) {
             qk = softmax(qk, k_cache.getCacheSeqLen());
