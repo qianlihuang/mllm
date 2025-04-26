@@ -1021,6 +1021,17 @@ public:
             child_tensors_.push_back(child);
         }
     }
+
+    /**
+     * \brief Detaches this tensor from its MasterTensor, making it an independent tensor.
+     *        Clears shape_offset_, shape_master_, and sets master_tensor_ to nullptr.
+     */
+    void detachFromMaster() {
+        master_tensor_ = nullptr;
+        shape_offset_.clear();
+        shape_master_.clear();
+    }
+
     /* Functions used for AggregatedTensor:
      * - addTensors
      */

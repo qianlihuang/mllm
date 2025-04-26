@@ -181,55 +181,96 @@ ErrorCode CPUKVCache::execute(vector<shared_ptr<Tensor>> inputs,
 
     // 处理 outputs[0] 的数据
     if (cache_seq_len_ <= SPARSE_THRESHOLD) {
-        // 直接浅拷贝所有 token
-        outputs[0]->shallowCopyFrom(cache_, false, {0, 0, 0, 0});
+        // Directly shallow copy all tokens (unchanged, assuming outputs[0] ctype is set elsewhere)
+        outputs[0]->shallowCopyFrom(cache_, false, {0, 0, 0, 0}); // 不会执行
     } else {
-        // 计算 cache_budget 和 local_size
+        // Calculate cache_budget, local_size, and sink
         int cache_budget = static_cast<int>(cache_seq_len_ * CACHE_BUDGET_RATIO);
         cache_budget = std::max(cache_budget, 1);
         int local_size = static_cast<int>(cache_budget * LOCAL_SIZE_RATIO);
         local_size = std::max(local_size, 1);
         int sink = cache_budget - local_size;
 
-        // 根据数据类型深拷贝 sink 和 local_size 的数据
-        for (int b = 0; b < inputs[0]->batch(); ++b) {
-            for (int h = 0; h < inputs[0]->head() * n_rep_; ++h) {
-                if (cache_.dtype() == MLLM_TYPE_F32) {
-                    float* dst_ptr = outputs[0]->ptrAt<float>(b, h, 0, 0);
-                    // 拷贝 sink
-                    float* src_ptr = cache_.ptrAt<float>(b, h, 0, 0);
-                    size_t sink_size = sink * inputs[0]->dimension() * sizeof(float);
-                    memcpy(dst_ptr, src_ptr, sink_size);
-                    // 拷贝 recent
-                    int start_recent = cache_seq_len_ - local_size;
-                    src_ptr = cache_.ptrAt<float>(b, h, start_recent, 0);
-                    dst_ptr = outputs[0]->ptrAt<float>(b, h, sink, 0);
-                    size_t recent_size = local_size * inputs[0]->dimension() * sizeof(float);
-                    memcpy(dst_ptr, src_ptr, recent_size);
-                } else if (cache_.dtype() == MLLM_TYPE_F16) {
-                    mllm_fp16_t* dst_ptr = outputs[0]->ptrAt<mllm_fp16_t>(b, h, 0, 0);
-                    mllm_fp16_t* src_ptr = cache_.ptrAt<mllm_fp16_t>(b, h, 0, 0);
-                    size_t sink_size = sink * inputs[0]->dimension() * sizeof(mllm_fp16_t);
-                    memcpy(dst_ptr, src_ptr, sink_size);
-                    int start_recent = cache_seq_len_ - local_size;
-                    src_ptr = cache_.ptrAt<mllm_fp16_t>(b, h, start_recent, 0);
-                    dst_ptr = outputs[0]->ptrAt<mllm_fp16_t>(b, h, sink, 0);
-                    size_t recent_size = local_size * inputs[0]->dimension() * sizeof(mllm_fp16_t);
-                    memcpy(dst_ptr, src_ptr, recent_size);
-                } else if (cache_.dtype() == MLLM_TYPE_Q8_0) {
-                    block_q8_0* dst_ptr = outputs[0]->ptrAt<block_q8_0>(b, h, 0, 0);
-                    block_q8_0* src_ptr = cache_.ptrAt<block_q8_0>(b, h, 0, 0);
-                    size_t sink_size = sink * inputs[0]->dimension() * sizeof(block_q8_0) / QK8_0;
-                    memcpy(dst_ptr, src_ptr, sink_size);
-                    int start_recent = cache_seq_len_ - local_size;
-                    src_ptr = cache_.ptrAt<block_q8_0>(b, h, start_recent, 0);
-                    dst_ptr = outputs[0]->ptrAt<block_q8_0>(b, h, sink, 0);
-                    size_t recent_size = local_size * inputs[0]->dimension() * sizeof(block_q8_0) / QK8_0;
-                    memcpy(dst_ptr, src_ptr, recent_size);
+        // Copy sink and local_size tokens based on ctype
+        if (cache_.ctype() == BSHD) {
+            for (int b = 0; b < inputs[0]->batch(); ++b) {
+                for (int h = 0; h < inputs[0]->head() * n_rep_; ++h) {
+                    if (cache_.dtype() == MLLM_TYPE_F32) {
+                        float* dst_ptr = outputs[0]->ptrAt<float>(b, h, 0, 0);
+                        // Copy sink tokens
+                        float* src_ptr = cache_.ptrAt<float>(b, h, 0, 0);
+                        size_t sink_size = sink * inputs[0]->dimension() * sizeof(float);
+                        memcpy(dst_ptr, src_ptr, sink_size);
+                        // Copy recent tokens
+                        int start_recent = cache_seq_len_ - local_size;
+                        src_ptr = cache_.ptrAt<float>(b, h, start_recent, 0);
+                        dst_ptr = outputs[0]->ptrAt<float>(b, h, sink, 0);
+                        size_t recent_size = local_size * inputs[0]->dimension() * sizeof(float);
+                        memcpy(dst_ptr, src_ptr, recent_size);
+                    } else if (cache_.dtype() == MLLM_TYPE_F16) {
+                        mllm_fp16_t* dst_ptr = outputs[0]->ptrAt<mllm_fp16_t>(b, h, 0, 0);
+                        mllm_fp16_t* src_ptr = cache_.ptrAt<mllm_fp16_t>(b, h, 0, 0);
+                        size_t sink_size = sink * inputs[0]->dimension() * sizeof(mllm_fp16_t);
+                        memcpy(dst_ptr, src_ptr, sink_size);
+                        int start_recent = cache_seq_len_ - local_size;
+                        src_ptr = cache_.ptrAt<mllm_fp16_t>(b, h, start_recent, 0);
+                        dst_ptr = outputs[0]->ptrAt<mllm_fp16_t>(b, h, sink, 0);
+                        size_t recent_size = local_size * inputs[0]->dimension() * sizeof(mllm_fp16_t);
+                        memcpy(dst_ptr, src_ptr, recent_size);
+                    } else if (cache_.dtype() == MLLM_TYPE_Q8_0) {
+                        block_q8_0* dst_ptr = outputs[0]->ptrAt<block_q8_0>(b, h, 0, 0);
+                        block_q8_0* src_ptr = cache_.ptrAt<block_q8_0>(b, h, 0, 0);
+                        size_t sink_size = sink * inputs[0]->dimension() * sizeof(block_q8_0) / QK8_0;
+                        memcpy(dst_ptr, src_ptr, sink_size);
+                        int start_recent = cache_seq_len_ - local_size;
+                        src_ptr = cache_.ptrAt<block_q8_0>(b, h, start_recent, 0);
+                        dst_ptr = outputs[0]->ptrAt<block_q8_0>(b, h, sink, 0);
+                        size_t recent_size = local_size * inputs[0]->dimension() * sizeof(block_q8_0) / QK8_0;
+                        memcpy(dst_ptr, src_ptr, recent_size);
+                    }
                 }
             }
+        } else if (cache_.ctype() == BHDS) {
+            for (int b = 0; b < inputs[0]->batch(); ++b) {
+                for (int h = 0; h < inputs[0]->head() * n_rep_; ++h) {
+                    for (int d = 0; d < inputs[0]->dimension(); ++d) {
+                        if (cache_.dtype() == MLLM_TYPE_F32) {
+                            float* dst_ptr = outputs[0]->ptrAt<float>(b, h, 0, d);
+                            // Copy sink tokens
+                            float* src_ptr = cache_.ptrAt<float>(b, h, 0, d);
+                            memcpy(dst_ptr, src_ptr, sink * sizeof(float));
+                            // Copy recent tokens
+                            int start_recent = cache_seq_len_ - local_size;
+                            src_ptr = cache_.ptrAt<float>(b, h, start_recent, d);
+                            dst_ptr = outputs[0]->ptrAt<float>(b, h, sink, d);
+                            memcpy(dst_ptr, src_ptr, local_size * sizeof(float));
+                        } else if (cache_.dtype() == MLLM_TYPE_F16) {
+                            mllm_fp16_t* dst_ptr = outputs[0]->ptrAt<mllm_fp16_t>(b, h, 0, d);
+                            mllm_fp16_t* src_ptr = cache_.ptrAt<mllm_fp16_t>(b, h, 0, d);
+                            memcpy(dst_ptr, src_ptr, sink * sizeof(mllm_fp16_t));
+                            int start_recent = cache_seq_len_ - local_size;
+                            src_ptr = cache_.ptrAt<mllm_fp16_t>(b, h, start_recent, d);
+                            dst_ptr = outputs[0]->ptrAt<mllm_fp16_t>(b, h, sink, d);
+                            memcpy(dst_ptr, src_ptr, local_size * sizeof(mllm_fp16_t));
+                        } else if (cache_.dtype() == MLLM_TYPE_Q8_0) {
+                            char* dst_ptr = (char*)outputs[0]->rawHostPtr() + outputs[0]->offset(b, h, 0, d) * sizeof(block_q8_0) / QK8_0;
+                            char* src_ptr = (char*)cache_.rawHostPtr() + cache_.offset(b, h, 0, d) * sizeof(block_q8_0) / QK8_0;
+                            size_t sink_size = sink * sizeof(block_q8_0) / QK8_0;
+                            memcpy(dst_ptr, src_ptr, sink_size);
+                            int start_recent = cache_seq_len_ - local_size;
+                            src_ptr = (char*)cache_.rawHostPtr() + cache_.offset(b, h, start_recent, d) * sizeof(block_q8_0) / QK8_0;
+                            dst_ptr = (char*)outputs[0]->rawHostPtr() + outputs[0]->offset(b, h, sink, d) * sizeof(block_q8_0) / QK8_0;
+                            size_t recent_size = local_size * sizeof(block_q8_0) / QK8_0;
+                            memcpy(dst_ptr, src_ptr, recent_size);
+                        }
+                    }
+                }
+            }
+        } else {
+            std::cout << "ERROR Ctype in KVCcache for outputs;" << std::endl;
         }
     }
+
     return Op::execute(inputs, outputs);
 }
 
@@ -246,6 +287,8 @@ ErrorCode CPUKVCache::setUp(vector<shared_ptr<Tensor>> inputs, vector<shared_ptr
         // 阈值以下，直接浅拷贝所有 token，只是分配了内存，没有实际拷贝数据
         outputs[0]->shallowCopyFrom(cache_, false, {0, 0, 0, 0});
     } else {
+        // 去掉浅拷贝的指针
+        outputs[0]->detachFromMaster();
         // 分配新内存
         outputs[0]->alloc();
     }
